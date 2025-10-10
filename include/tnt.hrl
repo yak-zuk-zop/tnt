@@ -82,7 +82,7 @@
 
 -record(tnt_reply, {
 	ref :: reference(),
-	answer :: ok | tnt_proto:tnt_tuple()
+	answer :: any()
 }).
 
 -record(tnt_error, {

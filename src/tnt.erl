@@ -57,6 +57,16 @@
     wait/2
 ]).
 
+-export_type([
+    client/0,
+    options/0,
+    space_id/0,
+    params/0,
+    key/0,
+    tnt_tuple/0,
+    operation/0
+]).
+
 %%-- Macros -------------------------------------------------------------------
 
 -define(DEFAULT_SYNC_TIMEOUT, 5_000).
@@ -71,6 +81,8 @@
 -type space_id() :: tnt_proto:space_id().
 -type tnt_tuple() :: tnt_proto:tnt_tuple().
 -type key() :: tnt_proto:key().
+-type operation() :: tnt_proto:operation().
+-type ops() :: list(operation()).
 -type params() :: #{
     index_id => non_neg_integer(),
     iterator => non_neg_integer(),
@@ -121,19 +133,19 @@ replace(Client, SpaceID, Data) ->
     Req = tnt_proto:request_replace(SpaceID, Data),
     tnt_worker:request(Client, Req).
 
--spec upsert(client(), space_id(), tnt_tuple(), tnt_tuple()) -> {ok, reference()}.
-upsert(Client, SpaceID, Data, Op) ->
-    Req = tnt_proto:request_upsert(SpaceID, Data, Op),
+-spec upsert(client(), space_id(), tnt_tuple(), ops()) -> {ok, reference()}.
+upsert(Client, SpaceID, Data, Ops) ->
+    Req = tnt_proto:request_upsert(SpaceID, Data, Ops),
     tnt_worker:request(Client, Req).
 
--spec update(client(), space_id(), key(), tnt_tuple()) -> {ok, reference()}.
-update(Client, SpaceID, Key, Op) ->
-    update(Client, SpaceID, Key, Op, #{}).
+-spec update(client(), space_id(), key(), ops()) -> {ok, reference()}.
+update(Client, SpaceID, Key, Ops) ->
+    update(Client, SpaceID, Key, Ops, #{}).
 
--spec update(client(), space_id(), key(), tnt_tuple(), params()) -> {ok, reference()}.
-update(Client, SpaceID, Key, Op, Params) ->
+-spec update(client(), space_id(), key(), ops(), params()) -> {ok, reference()}.
+update(Client, SpaceID, Key, Ops, Params) ->
     IndexID = maps:get(index_id, Params, 0),
-    Req = tnt_proto:request_update(SpaceID, Key, Op, IndexID),
+    Req = tnt_proto:request_update(SpaceID, Key, Ops, IndexID),
     tnt_worker:request(Client, Req).
 
 -spec delete(client(), space_id(), key()) -> {ok, reference()}.
@@ -190,18 +202,18 @@ replace_sync(Client, SpaceID, Data) ->
     {ok, Ref} = replace(Client, SpaceID, Data),
     wait(Ref, ?DEFAULT_SYNC_TIMEOUT).
 
--spec upsert_sync(client(), space_id(), tnt_tuple(), tnt_tuple()) -> result({ok, tnt_tuple()}).
-upsert_sync(Client, SpaceID, Data, Op) ->
-    {ok, Ref} = upsert(Client, SpaceID, Data, Op),
+-spec upsert_sync(client(), space_id(), tnt_tuple(), ops()) -> result({ok, tnt_tuple()}).
+upsert_sync(Client, SpaceID, Data, Ops) ->
+    {ok, Ref} = upsert(Client, SpaceID, Data, Ops),
     wait(Ref, ?DEFAULT_SYNC_TIMEOUT).
 
--spec update_sync(client(), space_id(), key(), tnt_tuple()) -> result({ok, tnt_tuple()}).
-update_sync(Client, SpaceID, Key, Op) ->
-    update_sync(Client, SpaceID, Key, Op, #{}).
+-spec update_sync(client(), space_id(), key(), ops()) -> result({ok, tnt_tuple()}).
+update_sync(Client, SpaceID, Key, Ops) ->
+    update_sync(Client, SpaceID, Key, Ops, #{}).
 
--spec update_sync(client(), space_id(), key(), tnt_tuple(), params()) -> result({ok, tnt_tuple()}).
-update_sync(Client, SpaceID, Key, Op, Params) ->
-    {ok, Ref} = update(Client, SpaceID, Key, Op, Params),
+-spec update_sync(client(), space_id(), key(), ops(), params()) -> result({ok, tnt_tuple()}).
+update_sync(Client, SpaceID, Key, Ops, Params) ->
+    {ok, Ref} = update(Client, SpaceID, Key, Ops, Params),
     wait(Ref, ?DEFAULT_SYNC_TIMEOUT).
 
 -spec delete_sync(client(), space_id(), key()) -> result({ok, tnt_tuple()}).
@@ -222,11 +234,11 @@ call_sync(Client, Func, Args) ->
     {ok, Ref} = call(Client, Func, Args),
     wait(Ref, ?DEFAULT_SYNC_TIMEOUT).
 
--spec eval_sync(client(), binary()) -> result({ok, tnt_tuple()}).
+-spec eval_sync(client(), binary()) -> result({ok, any()}).
 eval_sync(Client, Expr) ->
     eval_sync(Client, Expr, []).
 
--spec eval_sync(client(), binary(), tnt_tuple()) -> result({ok, tnt_tuple()}).
+-spec eval_sync(client(), binary(), tnt_tuple()) -> result({ok, any()}).
 eval_sync(Client, Expr, Args) ->
     {ok, Ref} = eval(Client, Expr, Args),
     wait(Ref, ?DEFAULT_SYNC_TIMEOUT).
@@ -254,7 +266,7 @@ get_space_id(Client, TableName) when is_list(TableName) ->
 
 %%-- helpers ------------------------------------------------------------------
 
--spec wait(reference(), timeout()) -> ok | result({ok, tnt_tuple()}).
+-spec wait(reference(), timeout()) -> ok | result({ok, any()}).
 wait(Ref, Timeout) ->
     receive
         #tnt_reply{ref = Ref, answer = ok} ->
