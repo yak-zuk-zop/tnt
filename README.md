@@ -47,47 +47,56 @@ Args = [
 {ok, Conn} = tnt:connect("localhost", 3301).
 ```
 
+> **Note**: to create a space see section Eval/Call
+
 2. CRUD
 ```erlang
 %%---- insert
 
-{ok, [1, "one"]} = tnt:insert_sync(Conn, 512, [1, <<"one">>]).
-{ok, [2, "two"]} = tnt:insert_sync(Conn, 512, [2, <<"two">>]).
+{ok, [1, "one"]} = tnt:insert_sync(Conn, 512, [1, "one"]).
+{ok, [2, <<"two">>]} = tnt:insert_sync(Conn, 512, [2, <<"two">>]).
 
 %%---- select
 
 {ok, [[1, "one"]]} = tnt:select_sync(Conn, 512, [1]).
 %% or
-Params = #{
+Params1 = #{
     index_id => 0,             %% IndexId (default: 0)
     limit    => ?SELECT_LIMIT, %%
     offset   => 0,             %% offset (default: 0)
     iterator => ?ITERATOR_EQ   %%
 },
-{ok, [[1, "one"]]} = tnt:select_sync(Conn, 512, [1], Params).
+{ok, [[1, "one"]]} = tnt:select_sync(Conn, 512, [1], Params1).
+
+%%---- select non existing key
+
+{ok, []} = tnt:select_sync(Conn, 512, [10]).
 
 %% select all
 
-{ok, [[1, "one"], [2, "two"]]} = tnt:select_sync(Conn, 512, []).
+{ok, [[1, "one"], [2, <<"two">>]]} = tnt:select_sync(Conn, 512, []).
 
 %%---- replace/update
 
 {ok, [1, "uno"]} = tnt:replace_sync(Conn, 512, [1, "uno"]).
 
-Op = [<<$=>>, 1, <<"due">>], %% or ?OP_ASSIGN(1, <<"due">>),
-{ok, [2, "due"]} = tnt:update_sync(Conn, 512, [2], [Op]).
+Op1 = [<<$=>>, 1, <<"due">>], %% or ?OP_ASSIGN(1, <<"due">>),
+{ok, [2, <<"due">>]} = tnt:update_sync(Conn, 512, [2], [Op1]).
 
 %% or
-Params = #{
+Params2 = #{
     index_id => 0 %% IndexId (default: 0)
 },
-{ok, [2, "due"]} = tnt:update_sync(Conn, 512, [2], [Op], Params).
+{ok, [2, "due"]} = tnt:update_sync(Conn, 512, [2], [Op1], Params2).
 
 %%---- upsert
 
-Op = [<<$=>>, 1, <<"three">>], %% or ?OP_ASSIGN(1, <<"three">>),
-Row = [3, <<"three">>],
-{ok, []} = tnt:upsert_sync(Conn, 512, Row, [Op]).
+Op2 = [<<$=>>, 1, <<"three">>], %% or ?OP_ASSIGN(1, <<"three">>),
+Row = [3, "three"],
+{ok, []} = tnt:upsert_sync(Conn, 512, Row, [Op2]).
+{ok, [[3, "three"]]} = tnt:select_sync(Conn, 512, [3]).
+{ok, []} = tnt:upsert_sync(Conn, 512, Row, [Op2]).
+{ok, [[3, <<"three">>]]} = tnt:select_sync(Conn, 512, [3]).
 
 %%---- delete
 
@@ -98,6 +107,9 @@ Params = #{
     index_id => 0 %% IndexId (default: 0)
 },
 {ok, [1, "uno"]} = tnt:delete_sync(Conn, 512, [1], Params).
+
+%% deletion of a non-existent key
+{ok, []} = tnt:delete_sync(Conn, 512, [1]).
 ```
 
 3. Eval/Call
@@ -106,11 +118,18 @@ Params = #{
 
 {ok, <<"hello">>} = tnt:eval_sync(Conn, <<"return 'hello'">>).
 
-{ok, [{"hello", ["hello"]}]} = tnt:eval_sync(Conn, <<"return {['hello']={'hello'}}">>).
+{ok, [{<<"hello">>, [<<"hello">>]}]} = tnt:eval_sync(Conn, <<"return {['hello']={'hello'}}">>).
+
+%%---- creating space example
+Query = <<"s = box.schema.space.create('test_table', {engine = 'memtx', if_not_exists = true})
+s:create_index('pk', {unique = true, type = 'HASH', if_not_exists = true})
+return s.id">>.
+
+{ok, 512} = tnt:eval_sync(Conn, Query).
 
 %%---- call
 
-{ok, 5} = tnt:call_sync(C2, <<"tonumber">>, [<<"5">>]).
+{ok, 5} = tnt:call_sync(Conn, <<"tonumber">>, [<<"5">>]).
 ```
 
 4. Misc
@@ -118,8 +137,10 @@ Params = #{
 %% get space id by name
 {ok, 512} = tnt:get_space_id(Conn, <<"test_table">>).
 
+{error, not_found} = tnt:get_space_id(Conn, <<"not_exists">>).
+
 %% ping
-ok = tnt:ping(Conn).
+ok = tnt:ping_sync(Conn).
 ```
 
 5. Close
