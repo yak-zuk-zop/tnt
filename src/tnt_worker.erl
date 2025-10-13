@@ -168,10 +168,10 @@ disconnected(enter, connected, Data = #data{host = Host, port = Port, socket = S
     {keep_state, Data#data{socket = undefined}, Action};
 
 disconnected(internal, {connect, Strategy}, #data{host = Host, port = Port} = Data) ->
-    ?LOG_WARNING("Connecting to ~ts:~tp...", [Host, Port]),
+    ?LOG_DEBUG("Connecting to ~ts:~tp...", [Host, Port]),
     case gen_tcp:connect(Host, Port, [binary, {active, false}], Data#data.connect_timeout) of
         {ok, Socket} ->
-            ?LOG_WARNING("Connection to ~ts:~tp is established", [Host, Port]),
+            ?LOG_INFO("Connection to ~ts:~tp is established", [Host, Port]),
             case handshake(Socket, Data) of
                 {ok, DataUpd} ->
                     {next_state, connected, DataUpd#data{
@@ -182,7 +182,7 @@ disconnected(internal, {connect, Strategy}, #data{host = Host, port = Port} = Da
                     {keep_state, DataUpd, Action}
             end;
         {error, What} ->
-            ?LOG_WARNING("Connection to ~ts:~tp failed with: ~ts", [
+            ?LOG_ERROR("Connection to ~ts:~tp failed with: ~ts", [
                 Host, Port, inet:format_error(What)
             ]),
             Action = retry_action(connect, build_strategy(Strategy, Data)),
@@ -214,7 +214,7 @@ disconnected(cast, {request, Req}, Data = #data{response_timeout = Timeout}) ->
         {next_state, state(), data()}.
 
 connected(enter, disconnected, Data = #data{credits = Credits}) ->
-    ?LOG_WARNING("Login as '~ts'", [credits_username(Credits)]),
+    ?LOG_INFO("Login as '~ts'", [credits_username(Credits)]),
     ok = inet:setopts(Data#data.socket, [{active, true}]),
     {keep_state, Data#data{sync = ?INITIAL_SYNC}};
 
@@ -225,11 +225,11 @@ connected(cast, {request, Req}, Data = #data{response_timeout = Timeout}) ->
     {keep_state, Data#data{pending = Queue}, Action};
 
 connected(info, {tcp_closed, Socket}, Data = #data{socket = Socket}) ->
-    ?LOG_WARNING("Connection is closed"),
+    ?LOG_DEBUG("Connection is closed"),
     {next_state, disconnected, Data};
 
 connected(info, {tcp, Socket, RxData}, #data{socket = Socket} = Data) ->
-    ?LOG_WARNING("Rx(~p): ~p", [byte_size(RxData), RxData]),
+    %?LOG_DEBUG("Rx(~p): ~p", [byte_size(RxData), RxData]),
     Bin = <<(Data#data.buffer)/binary, RxData/binary>>,
     case tnt_proto:decode(Bin) of
         incomplete ->
@@ -326,7 +326,7 @@ get_error(Code, Body) ->
 handshake(Socket, #data{response_timeout = Timeout} = Data) ->
     case gen_tcp:recv(Socket, ?IPROTO_GREETING_SIZE, Timeout) of
         {ok, <<Greeting:63/binary, $\n, SaltB64:44/binary, _/binary>>} ->
-            ?LOG_WARNING("Greeting: ~p", [Greeting]),
+            ?LOG_DEBUG("Greeting: ~p", [Greeting]),
             maybe_introduce(Socket, Data, base64:decode(SaltB64));
         {ok, Unknown} when is_binary(Unknown) ->
             ?LOG_ERROR("Unexpected greeting: ~p", [Unknown]),

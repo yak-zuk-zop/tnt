@@ -37,7 +37,8 @@
     tnt_tuple/0,
     key/0,
     sync/0,
-    proto/0
+    proto/0,
+    operation/0
 ]).
 
 %% Macros
@@ -76,21 +77,22 @@
 -type space_id() :: pos_integer().
 -type index_id() :: non_neg_integer().
 -type tnt_tuple() :: list().
--type key() :: nonempty_list().
+-type key() :: list().
 -type sync() :: 1 .. 16#FFFFFFFF.
 -type proto() :: list({integer(), term()}).
+-type operation() :: nonempty_list().
 
 %%-- API ----------------------------------------------------------------------
 
 -spec decode(binary()) -> {ok, tuple(), binary()} | incomplete | {error, any()}.
 decode(<<TotalSZ:5/binary, Rest/binary>>) ->
-    case msgpack:unpack(TotalSZ, ?MPACKOPTS) of
+    case msgpack:unpack(TotalSZ) of
         {ok, N} when is_integer(N), N =< byte_size(Rest) ->
             case msgpack:unpack_stream(Rest, ?MPACKOPTS) of
                 {error, _} = Err ->
                     Err;
                 {Hdr, BinBody} when is_list(Hdr) ->
-                    case msgpack:unpack_stream(BinBody, [{map_format, jsx}]) of
+                    case msgpack:unpack_stream(BinBody, ?MPACKOPTS) of
                         {error, _} = Err ->
                             Err;
                         {Body, Tail} ->
@@ -172,21 +174,21 @@ request_replace(SpaceID, Tuple) ->
         {?IPROTO_TUPLE, Tuple}
     ]).
 
--spec request_upsert(space_id(), tnt_tuple(), list()) -> request().
-request_upsert(SpaceID, Tuple, Op) ->
+-spec request_upsert(space_id(), tnt_tuple(), list(operation())) -> request().
+request_upsert(SpaceID, Tuple, Ops) ->
     make_request(?REQUEST_TYPE_UPSERT, [
         {?IPROTO_SPACE_ID, SpaceID},
         {?IPROTO_TUPLE, Tuple},
-        {?IPROTO_OPS, Op}
+        {?IPROTO_OPS, Ops}
     ]).
 
--spec request_update(space_id(), key(), list(), index_id()) -> request().
-request_update(SpaceID, Key, Op, IndexID) ->
+-spec request_update(space_id(), key(), list(operation()), index_id()) -> request().
+request_update(SpaceID, Key, Ops, IndexID) ->
     make_request(?REQUEST_TYPE_UPDATE, [
         {?IPROTO_SPACE_ID, SpaceID},
         {?IPROTO_INDEX_ID, IndexID},
         {?IPROTO_KEY, Key},
-        {?IPROTO_TUPLE, Op}
+        {?IPROTO_TUPLE, Ops}
     ]).
 
 -spec request_delete(space_id(), key(), index_id()) -> request().
