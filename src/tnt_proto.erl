@@ -6,7 +6,8 @@
 -export([
     decode/1,
     encode/2,
-    next_sync/1
+    next_sync/1,
+    get_error/2
 ]).
 
 %% requests
@@ -38,7 +39,8 @@
     key/0,
     sync/0,
     proto/0,
-    operation/0
+    operation/0,
+    error_message/0
 ]).
 
 %% Macros
@@ -81,38 +83,37 @@
 -type sync() :: 1 .. 16#FFFFFFFF.
 -type proto() :: list({integer(), term()}).
 -type operation() :: nonempty_list().
+-type error_message() :: {Code :: pos_integer(), Msg :: iodata()} | {unknown, proto()}.
 
 %%-- API ----------------------------------------------------------------------
 
--spec decode(binary()) -> {ok, tuple(), binary()} | incomplete | {error, any()}.
-decode(<<TotalSZ:5/binary, Rest/binary>>) ->
-    case msgpack:unpack(TotalSZ) of
-        {ok, N} when is_integer(N), N =< byte_size(Rest) ->
+-spec decode(binary()) -> Result when
+    Result :: {ok, tuple(), binary()} | {wait, pos_integer()} | {error, any()}.
+decode(Data) ->
+    case msgpack:unpack_stream(Data) of
+        {N, Rest} when is_integer(N), N =< byte_size(Rest) ->
             case msgpack:unpack_stream(Rest, ?MPACKOPTS) of
                 {error, _} = Err ->
                     Err;
                 {Hdr, BinBody} when is_list(Hdr) ->
-                    case msgpack:unpack_stream(BinBody, ?MPACKOPTS) of
+                    Opts = [{unpack_str, as_binary}, {map_format, jsx}],
+                    case msgpack:unpack_stream(BinBody, Opts) of
                         {error, _} = Err ->
                             Err;
                         {Body, Tail} ->
-                            [
-                                {?IPROTO_CODE, Code},
-                                {?IPROTO_SYNC, Sync},
-                                {?IPROTO_SCHEMA_ID, SchemaID}
-                            ] = Hdr,
+                            Code = proplists:get_value(?IPROTO_CODE, Hdr),
+                            Sync = proplists:get_value(?IPROTO_SYNC, Hdr),
+                            SchemaID = proplists:get_value(?IPROTO_SCHEMA_ID, Hdr),
                             {ok, {Code, Sync, SchemaID, Body}, Tail}
                     end
             end;
-        {ok, N} when is_integer(N) ->
-            incomplete;
-        {ok, Result} ->
-            {error, {unexpected, Result}};
+        {N, Rest} when is_integer(N) ->
+            {wait, N - byte_size(Rest)};
         {error, _} = Err ->
-            Err
-    end;
-decode(_Data) ->
-    incomplete.
+            Err;
+        {Result, _} ->
+            {error, {unexpected, Result}}
+    end.
 
 -spec encode(request(), sync()) -> binary().
 encode({ReqType, Body}, Sync) ->
@@ -123,12 +124,28 @@ encode({ReqType, Body}, Sync) ->
         ],
         ?MPACKOPTS
     ),
-    HeadSZMap = msgpack:pack(byte_size(Head) + byte_size(Body)),
-    <<HeadSZMap/binary, Head/binary, Body/binary>>.
+    TotalSZ = msgpack:pack(byte_size(Head) + byte_size(Body)),
+    <<TotalSZ/binary, Head/binary, Body/binary>>.
 
 -spec next_sync(sync()) -> sync().
 next_sync(16#FFFFFFFF) -> 1;
 next_sync(Sync) -> Sync + 1.
+
+-spec get_error(pos_integer(), proto()) -> error_message().
+get_error(Code, Body) ->
+    case proplists:get_value(?IPROTO_ERROR_24, Body) of
+        undefined ->
+            case proplists:get_value(?IPROTO_ERROR, Body) of
+                [_ | _] = ErrBox ->
+                    ErrCode = proplists:get_value(?MP_ERROR_ERRCODE, ErrBox),
+                    ErrStr  = proplists:get_value(?MP_ERROR_MESSAGE, ErrBox),
+                    {ErrCode, ErrStr};
+                _ ->
+                    {unknown, Body}
+            end;
+        Str ->
+            {Code band (?IPROTO_TYPE_ERROR - 1), Str}
+    end.
 
 %%-- requests -----------------------------------------------------------------
 

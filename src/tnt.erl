@@ -98,7 +98,7 @@ connect() ->
 
 -spec connect(options()) -> result({ok, client()}).
 connect(Options) ->
-    tnt_worker:start_link(Options).
+    tnt_worker:start(link, Options).
 
 -spec connect(host(), portnum()) -> result({ok, client()}).
 connect(Host, Port) ->

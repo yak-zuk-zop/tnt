@@ -87,5 +87,5 @@
 
 -record(tnt_error, {
 	ref :: reference(),
-	reason :: tnt_worker:error_message() | timeout
+	reason :: tnt_proto:error_message() | timeout
 }).

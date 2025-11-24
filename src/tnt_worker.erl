@@ -7,7 +7,7 @@
 
 %% API
 -export([
-    start_link/1,
+    start/2,
     stop/1,
     request/2
 ]).
@@ -15,7 +15,8 @@
 %% gen_statem callbacks
 -export([
     callback_mode/0,
-    init/1
+    init/1,
+    terminate/3
 ]).
 
 -export([
@@ -27,8 +28,7 @@
     client/0,
     host/0,
     portnum/0,
-    options/0,
-    error_message/0
+    options/0
 ]).
 
 %%-- Macros and Types ---------------------------------------------------------
@@ -42,6 +42,15 @@
 -define(DEFAULT_RECONNECT_POLICY, {
     infinity, {exponential, ?FIRST_RECONNECT_INT, ?MAX_RECONNECT_INT}
 }).
+-define(TCP_OPTS, [
+    binary,
+    {active, false},
+    {packet, raw},
+    {keepalive, true},
+    {nodelay, true},
+    {delay_send, false},
+    {buffer, 16#010000}
+]).
 
 %% Records
 
@@ -61,12 +70,14 @@
     response_timeout :: timeout(),
     socket :: mayhap(gen_tcp:socket()),
     holders = maps:new() :: holders(),
-    sync = 1 :: tnt_proto:sync(),
+    sync = ?INITIAL_SYNC :: tnt_proto:sync(),
     buffer = <<>> :: binary(),
     reconnect_policy :: tnt_retry:policy()
 }).
 
 %% Types
+
+-type linkage() :: monitor | link | nolink.
 
 -type data() :: #data{}.
 -type request() :: #request{}.
@@ -81,8 +92,6 @@
 -type internal_event_action() :: {next_event, internal, internal_event()}.
 -type timeout_action() :: {{timeout, timeout_event()}, timeout(), EventContent :: any()}.
 
--type error_message() :: {Code :: pos_integer(), Msg :: iodata()} | {unknown, tnt_proto:proto()}.
-
 -type pending() :: queue:queue(request()).
 -type holders() :: #{tnt_proto:sync() := request()}.
 -type credits() :: {Username :: binary(), Password :: binary()}.
@@ -90,6 +99,7 @@
 -type portnum() :: non_neg_integer().
 -type client() :: pid().
 -type mayhap(T) :: T | undefined.
+-type decode_result() :: {ok, tuple(), binary()} | {error, any()}.
 -type options() :: [
     {host, host()} |
     {port, portnum()} |
@@ -102,9 +112,13 @@
 
 %%-- API ----------------------------------------------------------------------
 
--spec start_link(options()) -> gen_statem:start_ret().
-start_link(Options) ->
-    gen_statem:start_link(?MODULE, Options, []).
+-spec start(linkage(), options()) -> gen_statem:start_ret().
+start(link, Options) ->
+    gen_statem:start_link(?MODULE, Options, []);
+start(monitor, Options) ->
+    gen_statem:start_monitor(?MODULE, Options, []);
+start(nolink, Options) ->
+    gen_statem:start(?MODULE, Options, []).
 
 -spec stop(client()) -> ok.
 stop(Client) ->
@@ -142,6 +156,11 @@ init(Options) ->
     },
     {ok, disconnected, Data}.
 
+-spec terminate(any(), state(), data()) -> ok.
+terminate(Reason, State, Data) ->
+    ?LOG_DEBUG("stopped with: ~p, state: ~p, data: ~p", [Reason, State, Data]),
+    ok.
+
 %%-- Disconnected state -------------------------------------------------------
 
 -spec disconnected
@@ -165,11 +184,16 @@ disconnected(enter, connected, Data = #data{host = Host, port = Port, socket = S
     ?LOG_WARNING("Connection to ~ts:~tp closed! Reconnecting...", [Host, Port]),
     ok = gen_tcp:close(Socket),
     Action = timeout_action(connect, ?NOW),
-    {keep_state, Data#data{socket = undefined}, Action};
+    DataUpd = Data#data{
+        socket = undefined,
+        holders = maps:new(),
+        sync = ?INITIAL_SYNC
+    },
+    {keep_state, DataUpd, Action};
 
 disconnected(internal, {connect, Strategy}, #data{host = Host, port = Port} = Data) ->
     ?LOG_DEBUG("Connecting to ~ts:~tp...", [Host, Port]),
-    case gen_tcp:connect(Host, Port, [binary, {active, false}], Data#data.connect_timeout) of
+    case gen_tcp:connect(Host, Port, ?TCP_OPTS, Data#data.connect_timeout) of
         {ok, Socket} ->
             ?LOG_INFO("Connection to ~ts:~tp is established", [Host, Port]),
             case handshake(Socket, Data) of
@@ -182,19 +206,24 @@ disconnected(internal, {connect, Strategy}, #data{host = Host, port = Port} = Da
                     {keep_state, DataUpd, Action}
             end;
         {error, What} ->
-            ?LOG_ERROR("Connection to ~ts:~tp failed with: ~ts", [
+            ?LOG_ERROR("Failed to connect to ~ts:~tp with: ~ts", [
                 Host, Port, inet:format_error(What)
             ]),
             Action = retry_action(connect, build_strategy(Strategy, Data)),
             {keep_state, Data, Action}
     end;
 
+disconnected(internal, {finish, connect}, _Data) ->
+    {stop, normal};
+
 disconnected({timeout, connect}, Strategy, _Data) ->
     {keep_state_and_data, next_event_action({connect, Strategy})};
 
-disconnected(info, {request_timeout, #request{ref = Ref, owner = Owner}}, _Data) ->
+disconnected(info, {request_timeout, Req = #request{ref = Ref, owner = Owner}}, Data) ->
+    ?LOG_ERROR("Timeout(~p)", [Ref]),
     Owner ! #tnt_error{ref = Ref, reason = timeout},
-    keep_state_and_data;
+    Queue = queue:delete(Req, Data#data.pending),
+    {keep_state, Data#data{pending = Queue}};
 
 disconnected(cast, {request, Req}, Data = #data{response_timeout = Timeout}) ->
     Request = create_req_timer(Req, Timeout),
@@ -213,10 +242,9 @@ disconnected(cast, {request, Req}, Data = #data{response_timeout = Timeout}) ->
         {keep_state, data(), [gen_statem:action()]} |
         {next_state, state(), data()}.
 
-connected(enter, disconnected, Data = #data{credits = Credits}) ->
+connected(enter, disconnected, #data{credits = Credits}) ->
     ?LOG_INFO("Login as '~ts'", [credits_username(Credits)]),
-    ok = inet:setopts(Data#data.socket, [{active, true}]),
-    {keep_state, Data#data{sync = ?INITIAL_SYNC}};
+    keep_state_and_data;
 
 connected(cast, {request, Req}, Data = #data{response_timeout = Timeout}) ->
     Request = create_req_timer(Req, Timeout),
@@ -229,71 +257,65 @@ connected(info, {tcp_closed, Socket}, Data = #data{socket = Socket}) ->
     {next_state, disconnected, Data};
 
 connected(info, {tcp, Socket, RxData}, #data{socket = Socket} = Data) ->
-    %?LOG_DEBUG("Rx(~p): ~p", [byte_size(RxData), RxData]),
     Bin = <<(Data#data.buffer)/binary, RxData/binary>>,
-    case tnt_proto:decode(Bin) of
-        incomplete ->
-            {keep_state, Data#data{buffer = Bin}};
-        {ok, {Code, Sync, _SchemaID, Body}, Tail} ->
-            case maps:take(Sync, Data#data.holders) of
-                {Req, HoldersUpd} ->
-                    reply_answer(Code, Body, Req),
-                    {keep_state, Data#data{buffer = Tail, holders = HoldersUpd}};
-                error ->
-                    ?LOG_ERROR("Failed to find owner by sync(~p). Reply: ~p", [Sync, Body]),
-                    {keep_state, Data#data{buffer = Tail}}
-            end;
-        {error, Reason} ->
-            ?LOG_ERROR("Decoding failed with: ~p", [Reason]),
-            {keep_state, Data#data{buffer = <<>>}}
-    end;
+    Res = case tnt_proto:decode(Bin) of
+        {wait, Sz} ->
+            ?LOG_DEBUG("Rx(~tp); incomplete (expected: ~tp bytes)",
+                [byte_size(RxData), Sz]
+            ),
+            recv_and_decode(Socket, Sz, Bin, Data#data.response_timeout);
+        Else ->
+            Else
+    end,
+    DataUpd = handle_response(Res, Data),
+    Action = next_event_action(process_queue),
+    {keep_state, DataUpd, Action};
 
-connected(info, {request_timeout, #request{ref = Ref, owner = Owner}}, _Data) ->
+connected(info, {request_timeout, Req = #request{ref = Ref, owner = Owner}}, Data) ->
+    ?LOG_ERROR("Timeout(~p)", [Ref]),
     Owner ! #tnt_error{ref = Ref, reason = timeout},
-    keep_state_and_data;
+    HoldersUpd = purge_holders(Ref, Data#data.holders),
+    Queue = queue:delete(Req, Data#data.pending),
+    {keep_state, Data#data{
+        holders = HoldersUpd,
+        pending = Queue
+    }};
 
 connected(internal, process_queue, #data{sync = Sync, pending = Queue} = Data) ->
     case queue:out(Queue) of
         {empty, _} ->
             keep_state_and_data;
 
-        {{value, Req = #request{msg = Msg, timer = Timer}}, Q} ->
-            try
-                TxData = tnt_proto:encode(Msg, Sync),
-                case gen_tcp:send(Data#data.socket, TxData) of
-                    ok ->
-                        _ = erlang:cancel_timer(Timer),
-                        Holders = Data#data.holders,
-                        DataUpd = Data#data{
-                            pending = Q,
-                            holders = Holders#{Sync => Req#request{timer = undefined}},
-                            sync = tnt_proto:next_sync(Sync)
-                        },
-                        {keep_state, DataUpd, next_event_action(process_queue)};
+        {{value, Req = #request{msg = Msg, timer = Timer, ref = Ref}}, Q} ->
+            TxData = tnt_proto:encode(Msg, Sync),
+            Socket = Data#data.socket,
+            case gen_tcp:send(Socket, TxData) of
+                ok ->
+                    _ = erlang:cancel_timer(Timer),
+                    Holders = Data#data.holders,
+                    DataUpd = Data#data{
+                        pending = Q,
+                        holders = Holders#{Sync => Req#request{timer = undefined}},
+                        sync = tnt_proto:next_sync(Sync)
+                    },
+                    ok = inet:setopts(Socket, [{active, once}]),
+                    {keep_state, DataUpd};
 
-                    {error, Err} ->
-                        ?LOG_ERROR("Failed(~tp) sending ~p", [Err, Msg]),
-                        {next_state, disconnected, Data}
-                end
-            catch
-                error:What:STrace ->
-                    ?LOG_ERROR(
-                        "Exception(~p) occured while encoding ~p. Stacktrace: ~p",
-                        [What, Msg, STrace]
-                    ),
-                    %% SKIP-IT!!!
-                    Action = next_event_action(process_queue),
-                    {keep_state, Data#data{pending = Q}, Action}
+                {error, Err} ->
+                    ?LOG_ERROR("Failed to send(~tp) ~tp:~p with ~p", [
+                        Sync, tnt_proto:get_request_type(Msg), Ref, Err
+                    ]),
+                    {next_state, disconnected, Data}
             end
     end.
 
 %%-- internals ----------------------------------------------------------------
 
--spec reply_answer(integer(), tnt_proto:proto(), request()) -> ok.
-reply_answer(?IPROTO_OK, [{}], #request{ref = Ref, owner = Pid}) ->
+-spec reply(integer(), tnt_proto:proto(), request()) -> ok.
+reply(?IPROTO_OK, [{}], #request{ref = Ref, owner = Pid}) ->
     Pid ! #tnt_reply{ref = Ref, answer = ok};
 %% IPROTO_DATA
-reply_answer(?IPROTO_OK, [{16#30, Body}], #request{ref = Ref, msg = Msg, owner = Pid}) ->
+reply(?IPROTO_OK, [{16#30, Body}], #request{ref = Ref, msg = Msg, owner = Pid}) ->
     Val = case {Body, tnt_proto:get_request_type(Msg)} of
         {[V], Type} when Type =/= ?REQUEST_TYPE_SELECT ->
             V;
@@ -302,25 +324,11 @@ reply_answer(?IPROTO_OK, [{16#30, Body}], #request{ref = Ref, msg = Msg, owner =
     end,
     Pid ! #tnt_reply{ref = Ref, answer = Val},
     ok;
-reply_answer(Code, Body, #request{ref = Ref, owner = Pid}) ->
-    Pid ! #tnt_error{ref = Ref, reason = get_error(Code, Body)},
+reply(Code, Body, #request{ref = Ref, owner = Pid}) ->
+    Pid ! #tnt_error{ref = Ref, reason = tnt_proto:get_error(Code, Body)},
     ok.
 
--spec get_error(pos_integer(), tnt_proto:proto()) -> error_message().
-get_error(Code, Body) ->
-    case proplists:get_value(16#31, Body, undefined) of %% IPOTO_ERROR_24
-        undefined ->
-            case proplists:get_value(16#52, Body, undefined) of %% IPROTO_ERROR
-                [_ | _] = ErrBox ->
-                    ErrCode = proplists:get_value(?MP_ERROR_ERRCODE, ErrBox, undefined),
-                    ErrStr  = proplists:get_value(?MP_ERROR_MESSAGE, ErrBox, undefined),
-                    {ErrCode, ErrStr};
-                _ ->
-                    {unknown, Body}
-            end;
-        Str ->
-            {Code band (?IPROTO_TYPE_ERROR - 1), Str}
-    end.
+%%
 
 -spec handshake(gen_tcp:socket(), data()) -> {ok | error, data()}.
 handshake(Socket, #data{response_timeout = Timeout} = Data) ->
@@ -349,7 +357,7 @@ maybe_introduce(Socket, Data = #data{credits = {User, Pwd}}, Salt) ->
                     sync = tnt_proto:next_sync(Sync)
                 }};
             {ok, {Code, _Sync, _SchemaID, Body}, Tail} ->
-                ?LOG_ERROR("Auth failed with: ~p", [get_error(Code, Body)]),
+                ?LOG_ERROR("Auth failed with: ~p", [tnt_proto:get_error(Code, Body)]),
                 {error, Data#data{
                     buffer = Tail
                 }};
@@ -367,23 +375,57 @@ maybe_introduce(_, Data, _) ->
         buffer = <<>>
     }}.
 
+-spec handle_response(decode_result(), data()) -> data().
+handle_response({ok, {Code, Sync, _SchemaID, Body}, Tail}, Data) ->
+    case maps:take(Sync, Data#data.holders) of
+        {Req, HoldersUpd} ->
+            reply(Code, Body, Req),
+            Data#data{buffer = Tail, holders = HoldersUpd};
+        error ->
+            ?LOG_ERROR("Failed to find owner by sync(~p)", [Sync]),
+            Data#data{buffer = Tail}
+    end;
+handle_response({error, Reason}, Data) ->
+    ?LOG_ERROR("Failed to decode with: ~p", [Reason]),
+    Data#data{buffer = <<>>}.
+
+%%
+
 -spec send_sync_and_decode(Socket, TxData, Timeout) -> Result when
     Socket :: gen_tcp:socket(),
     TxData :: binary(),
     Timeout :: timeout(),
-    Result :: {ok, tuple(), binary()} | {error, any()}.
+    Result :: decode_result().
 send_sync_and_decode(Socket, TxData, Timeout) ->
     case gen_tcp:send(Socket, TxData) of
         ok ->
-            case gen_tcp:recv(Socket, 0, Timeout) of
-                {ok, RxData} ->
-                    tnt_proto:decode(RxData);
-                {error, _} = Err ->
-                    Err
+            recv_and_decode(Socket, 0, <<>>, Timeout);
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec recv_and_decode(Socket, Size, Bin, Timeout) -> Result when
+    Socket :: gen_tcp:socket(),
+    Size :: non_neg_integer(),
+    Bin :: binary(),
+    Timeout :: timeout(),
+    Result :: decode_result().
+recv_and_decode(Socket, Size, Bin, Timeout) ->
+    case gen_tcp:recv(Socket, Size, Timeout) of
+        {ok, RxData} ->
+            ?LOG_DEBUG("Rx(~p)", [byte_size(RxData)]),
+            Acc = <<Bin/binary, RxData/binary>>,
+            case tnt_proto:decode(Acc) of
+                {wait, _} ->
+                    recv_and_decode(Socket, Size, Acc, Timeout);
+                Else ->
+                    Else
             end;
         {error, _} = Err ->
             Err
     end.
+
+%%
 
 -spec credits_build(mayhap(binary()), mayhap(binary())) -> mayhap(credits()).
 credits_build(User, Pwd) when is_binary(User), is_binary(Pwd) ->
@@ -396,6 +438,8 @@ credits_username(undefined) ->
     <<"guest">>;
 credits_username({Username, _}) ->
     Username.
+
+%%
 
 -spec new_request(tnt_proto:request(), pid()) -> request().
 new_request(Msg, Owner) ->
@@ -412,6 +456,15 @@ create_req_timer(Req, Msecs) ->
     Req#request{
         timer = erlang:send_after(Msecs, self(), {request_timeout, Req})
     }.
+
+%%
+
+-spec purge_holders(reference(), holders()) -> holders().
+purge_holders(In, Holders) ->
+    Pred = fun (_Key, #request{ref = Ref}) ->
+        Ref =:= In
+    end,
+    maps:filter(Pred, Holders).
 
 %%
 

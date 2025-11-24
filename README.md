@@ -122,10 +122,12 @@ Params = #{
 
 %%---- creating space example
 Query = <<"s = box.schema.space.create('test_table', {engine = 'memtx', if_not_exists = true})
-s:create_index('pk', {unique = true, type = 'HASH', if_not_exists = true})
+s:create_index('pk', {unique = true, type = 'TREE', if_not_exists = true})
 return s.id">>.
 
 {ok, 512} = tnt:eval_sync(Conn, Query).
+
+tnt:eval_sync(Conn, <<"return box.space[512]:len()">>).
 
 %%---- call
 
