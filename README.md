@@ -1,7 +1,7 @@
 TNT
 ===
 
-A native Erlang client for Tarantool. Compatible with Tarantool 3.x, 2.11.x and Erlang/OTP 26.
+A native Erlang client for Tarantool. Compatible with Tarantool 3.x, 2.11.x.
 
 See the [CHANGELOG](CHANGELOG.md) for the list of implemented features.
 

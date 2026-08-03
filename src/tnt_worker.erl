@@ -9,7 +9,8 @@
 -export([
     start/2,
     stop/1,
-    request/2
+    request/2,
+    request_sync/2
 ]).
 
 %% gen_statem callbacks
@@ -57,7 +58,7 @@
 -record(request, {
     ref   :: reference(),
     msg   :: tnt_proto:request(),
-    owner :: pid(),
+    owner :: mayhap(pid() | {call, gen_statem:from()}),
     timer :: mayhap(reference())
 }).
 
@@ -89,6 +90,7 @@
 -type timeout_event() :: connect.
 -type internal_event() :: connect_event() | process_queue | {finish, timeout_event()}.
 
+-type reply_action() :: {reply, gen_statem:from(), Reply :: any()}.
 -type internal_event_action() :: {next_event, internal, internal_event()}.
 -type timeout_action() :: {{timeout, timeout_event()}, timeout(), EventContent :: any()}.
 
@@ -129,6 +131,11 @@ request(Client, Msg) ->
     Req = new_request(Msg, self()),
     ok = gen_statem:cast(Client, {request, Req}),
     {ok, Req#request.ref}.
+
+-spec request_sync(client(), tnt_proto:request()) -> {ok | error, any()}.
+request_sync(Client, Msg) ->
+    Req = new_request(Msg, undefined),
+    gen_statem:call(Client, {request, Req}).
 
 %%-- gen_statem callbacks -----------------------------------------------------
 
@@ -219,11 +226,14 @@ disconnected(internal, {finish, connect}, _Data) ->
 disconnected({timeout, connect}, Strategy, _Data) ->
     {keep_state_and_data, next_event_action({connect, Strategy})};
 
-disconnected(info, {request_timeout, Req = #request{ref = Ref, owner = Owner}}, Data) ->
+disconnected(info, {request_timeout, Req = #request{ref = Ref}}, Data) ->
     ?LOG_ERROR("Timeout(~p)", [Ref]),
-    Owner ! #tnt_error{ref = Ref, reason = timeout},
+    ok = reply(Req, {error, timeout}),
     Queue = queue:delete(Req, Data#data.pending),
     {keep_state, Data#data{pending = Queue}};
+
+disconnected({call, From}, {request, _}, _Data) ->
+    {keep_state_and_data, reply_action(From, {error, ?FUNCTION_NAME})};
 
 disconnected(cast, {request, Req}, Data = #data{response_timeout = Timeout}) ->
     Request = create_req_timer(Req, Timeout),
@@ -245,6 +255,12 @@ disconnected(cast, {request, Req}, Data = #data{response_timeout = Timeout}) ->
 connected(enter, disconnected, #data{credits = Credits}) ->
     ?LOG_INFO("Login as '~ts'", [credits_username(Credits)]),
     keep_state_and_data;
+
+connected({call, _} = Owner, {request, Req}, Data = #data{response_timeout = Timeout}) ->
+    Request = create_req_timer(Req#request{owner = Owner}, Timeout),
+    Queue = queue:in(Request, Data#data.pending),
+    Action = next_event_action(process_queue),
+    {keep_state, Data#data{pending = Queue}, Action};
 
 connected(cast, {request, Req}, Data = #data{response_timeout = Timeout}) ->
     Request = create_req_timer(Req, Timeout),
@@ -271,9 +287,9 @@ connected(info, {tcp, Socket, RxData}, #data{socket = Socket} = Data) ->
     Action = next_event_action(process_queue),
     {keep_state, DataUpd, Action};
 
-connected(info, {request_timeout, Req = #request{ref = Ref, owner = Owner}}, Data) ->
+connected(info, {request_timeout, Req = #request{ref = Ref}}, Data) ->
     ?LOG_ERROR("Timeout(~p)", [Ref]),
-    Owner ! #tnt_error{ref = Ref, reason = timeout},
+    ok = reply(Req, {error, timeout}),
     HoldersUpd = purge_holders(Ref, Data#data.holders),
     Queue = queue:delete(Req, Data#data.pending),
     {keep_state, Data#data{
@@ -312,21 +328,20 @@ connected(internal, process_queue, #data{sync = Sync, pending = Queue} = Data) -
 %%-- internals ----------------------------------------------------------------
 
 -spec reply(integer(), tnt_proto:proto(), request()) -> ok.
-reply(?IPROTO_OK, [{}], #request{ref = Ref, owner = Pid}) ->
-    Pid ! #tnt_reply{ref = Ref, answer = ok};
-%% IPROTO_DATA
-reply(?IPROTO_OK, [{16#30, Body}], #request{ref = Ref, msg = Msg, owner = Pid}) ->
-    Val = case {Body, tnt_proto:get_request_type(Msg)} of
-        {[V], Type} when Type =/= ?REQUEST_TYPE_SELECT ->
-            V;
-        {Else, _} ->
-            Else
-    end,
-    Pid ! #tnt_reply{ref = Ref, answer = Val},
+reply(?IPROTO_OK, Body, Req) ->
+    Type = tnt_proto:get_request_type(Req#request.msg),
+    Reply = {ok, tnt_proto:make_reply_ok(Type, Body)},
+    reply(Req, Reply);
+reply(Code, Body, Req) ->
+    Reply = {error, tnt_proto:get_error(Code, Body)},
+    reply(Req, Reply).
+
+-spec reply(request(), {ok | error, any()}) -> ok.
+reply(#request{ref = Ref, owner = Pid}, Answer) when is_pid(Pid) ->
+    Pid ! #tnt_reply{ref = Ref, answer = Answer},
     ok;
-reply(Code, Body, #request{ref = Ref, owner = Pid}) ->
-    Pid ! #tnt_error{ref = Ref, reason = tnt_proto:get_error(Code, Body)},
-    ok.
+reply(#request{owner = {call, From}}, Answer) ->
+    gen_statem:reply(From, Answer).
 
 %%
 
@@ -351,7 +366,7 @@ maybe_introduce(Socket, Data = #data{credits = {User, Pwd}}, Salt) ->
         AuthReq = tnt_proto:request_auth(User, Pwd, Salt),
         TxData = tnt_proto:encode(AuthReq, Sync),
         case send_sync_and_decode(Socket, TxData, Timeout) of
-            {ok, {?IPROTO_OK, _Sync, _SchemaID, [{}]}, Tail} -> %% [{}] = ok
+            {ok, {?IPROTO_OK, _Sync, _SchemaID, ?IPROTO_BODY_OK}, Tail} ->
                 {ok, Data#data{
                     buffer = Tail,
                     sync = tnt_proto:next_sync(Sync)
@@ -441,7 +456,7 @@ credits_username({Username, _}) ->
 
 %%
 
--spec new_request(tnt_proto:request(), pid()) -> request().
+-spec new_request(tnt_proto:request(), mayhap(pid())) -> request().
 new_request(Msg, Owner) ->
     #request{
         ref = make_ref(),
@@ -475,6 +490,10 @@ build_strategy(Strategy, _) ->
     Strategy.
 
 %%
+
+-spec reply_action(gen_statem:from(), any()) -> reply_action().
+reply_action(To, Msg) ->
+    {reply, To, Msg}.
 
 -spec retry_action(timeout_event(), tnt_retry:strategy()) -> Action when
     Action :: timeout_action() | internal_event_action().

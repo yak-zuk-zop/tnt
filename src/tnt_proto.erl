@@ -7,6 +7,7 @@
     decode/1,
     encode/2,
     next_sync/1,
+    make_reply_ok/2,
     get_error/2
 ]).
 
@@ -14,6 +15,7 @@
 -export([
     request_auth/3,
     request_select/6,
+    request_select/3,
     request_insert/2,
     request_replace/2,
     request_upsert/3,
@@ -33,6 +35,7 @@
 
 -export_type([
     request/0,
+    request_type/0,
     space_id/0,
     index_id/0,
     tnt_tuple/0,
@@ -75,7 +78,8 @@
 
 %% Types
 
--type request() :: {Type :: pos_integer(), Body :: binary()}.
+-type request_type() :: pos_integer().
+-type request() :: {request_type(), Body :: binary()}.
 -type space_id() :: pos_integer().
 -type index_id() :: non_neg_integer().
 -type tnt_tuple() :: list().
@@ -147,6 +151,18 @@ get_error(Code, Body) ->
             {Code band (?IPROTO_TYPE_ERROR - 1), Str}
     end.
 
+-spec make_reply_ok(request_type(), proto()) -> term().
+make_reply_ok(_Type, ?IPROTO_BODY_OK) ->
+    ok;
+make_reply_ok(Type, [{?IPROTO_DATA, [V]}]) when Type =/= ?REQUEST_TYPE_SELECT ->
+    V;
+make_reply_ok(_Type, [{?IPROTO_DATA, Body}]) ->
+    Body.
+
+-spec get_request_type(request()) -> request_type().
+get_request_type({Type, _}) ->
+    Type.
+
 %%-- requests -----------------------------------------------------------------
 
 -spec request_auth(binary(), binary(), binary()) -> request().
@@ -176,6 +192,14 @@ request_select(SpaceID, IndexID, Key, It, Limit, Offs) ->
         {?IPROTO_ITERATOR, It},
         {?IPROTO_KEY, Key}
     ]).
+
+-spec request_select(space_id(), key(), map()) -> request().
+request_select(SpaceID, Key, Params) ->
+    IndexID = maps:get(index_id, Params, 0),
+    It = maps:get(iterator, Params, ?ITERATOR_EQ),
+    Limit = maps:get(limit, Params, ?SELECT_LIMIT),
+    Offs = maps:get(offset, Params, 0),
+    request_select(SpaceID, IndexID, Key, It, Limit, Offs).
 
 -spec request_insert(space_id(), tnt_tuple()) -> request().
 request_insert(SpaceID, Tuple) ->
@@ -235,12 +259,6 @@ request_eval(Expr, Args) ->
 -spec request_ping() -> request().
 request_ping() ->
     make_request(?REQUEST_TYPE_PING, []).
-
-%%
-
--spec get_request_type(request()) -> Type :: pos_integer().
-get_request_type({Type, _}) ->
-    Type.
 
 %%-- internals ----------------------------------------------------------------
 

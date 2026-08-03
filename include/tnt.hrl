@@ -19,6 +19,8 @@
 -define(IPROTO_UNKNOWN, -1).
 -define(IPROTO_TYPE_ERROR, (1 bsl 15)).
 
+-define(IPROTO_BODY_OK, [{}]).
+
 %%-- Key compare iterators ----------------------------------------------------
 
 -define(ITERATOR_EQ,  0).
@@ -81,11 +83,6 @@
 %%
 
 -record(tnt_reply, {
-	ref :: reference(),
-	answer :: any()
-}).
-
--record(tnt_error, {
-	ref :: reference(),
-	reason :: tnt_proto:error_message() | timeout
+    ref :: reference(),
+    answer :: {ok, any()} | {error, tnt_proto:error_message() | timeout}
 }).
