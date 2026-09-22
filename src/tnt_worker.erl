@@ -431,13 +431,13 @@ send_sync_and_decode(Socket, TxData, Timeout) ->
     Timeout :: timeout(),
     Result :: decode_result().
 recv_and_decode(Socket, Size, Bin, Timeout) ->
-    case gen_tcp:recv(Socket, Size, Timeout) of
+    case gen_tcp:recv(Socket, min(Size, 16#400000), Timeout) of
         {ok, RxData} ->
             ?LOG_DEBUG("Rx(~p)", [byte_size(RxData)]),
             Acc = <<Bin/binary, RxData/binary>>,
             case tnt_proto:decode(Acc) of
-                {wait, _} ->
-                    recv_and_decode(Socket, Size, Acc, Timeout);
+                {wait, Sz} ->
+                    recv_and_decode(Socket, Sz, Acc, Timeout);
                 Else ->
                     Else
             end;
