@@ -43,7 +43,7 @@
 -define(DEFAULT_RECONNECT_POLICY, {
     infinity, {exponential, ?FIRST_RECONNECT_INT, ?MAX_RECONNECT_INT}
 }).
--define(TCP_OPTS, [
+-define(DEFAULT_SOCK_OPTS, [
     binary,
     {active, false},
     {packet, raw},
@@ -66,6 +66,7 @@
     host :: host(),
     port :: portnum(),
     credits :: mayhap(credits()),
+    sock_opts :: socket_options(),
     pending :: pending(),
     connect_timeout :: timeout(),
     response_timeout :: timeout(),
@@ -97,8 +98,9 @@
 -type pending() :: queue:queue(request()).
 -type holders() :: #{tnt_proto:sync() := request()}.
 -type credits() :: {Username :: binary(), Password :: binary()}.
--type host() :: string() | atom() | inet:ip_address().
--type portnum() :: non_neg_integer().
+-type host() :: inet:hostname() | inet:ip_address().
+-type portnum() :: inet:port_number().
+-type socket_options() :: [gen_tcp:option()].
 -type client() :: pid().
 -type mayhap(T) :: T | undefined.
 -type decode_result() :: {ok, tuple(), binary()} | {error, any()}.
@@ -107,6 +109,7 @@
     {port, portnum()} |
     {username, binary()} |
     {password, binary()} |
+    {sock_opts, socket_options()} |
     {connect_timeout, timeout()} |
     {response_timeout, timeout()} |
     {reconnect_policy, tnt_retry:policy()}
@@ -152,10 +155,12 @@ init(Options) ->
     ConnectTimeout  = proplists:get_value(connect_timeout, Options, ?DEFAULT_TIMEOUT),
     ResponseTimeout = proplists:get_value(response_timeout, Options, ?DEFAULT_TIMEOUT),
     ReconnectPolicy = proplists:get_value(reconnect_policy, Options, ?DEFAULT_RECONNECT_POLICY),
+    UserSocketOpts  = proplists:get_value(sock_opts, Options, []),
     Data = #data{
         host = Host,
         port = Port,
         credits = credits_build(Username, Password),
+        sock_opts = sock_opts(UserSocketOpts, ?DEFAULT_SOCK_OPTS),
         connect_timeout = ConnectTimeout,
         response_timeout = ResponseTimeout,
         pending = queue:new(),
@@ -200,7 +205,7 @@ disconnected(enter, connected, Data = #data{host = Host, port = Port, socket = S
 
 disconnected(internal, {connect, Strategy}, #data{host = Host, port = Port} = Data) ->
     ?LOG_DEBUG("Connecting to ~ts:~tp...", [Host, Port]),
-    case gen_tcp:connect(Host, Port, ?TCP_OPTS, Data#data.connect_timeout) of
+    case gen_tcp:connect(Host, Port, Data#data.sock_opts, Data#data.connect_timeout) of
         {ok, Socket} ->
             ?LOG_INFO("Connection to ~ts:~tp is established", [Host, Port]),
             case handshake(Socket, Data) of
@@ -453,6 +458,18 @@ credits_username(undefined) ->
     <<"guest">>;
 credits_username({Username, _}) ->
     Username.
+
+-spec sock_opts(socket_options(), socket_options()) -> socket_options().
+sock_opts([], Default) ->
+    Default;
+sock_opts(Opts, Default) ->
+    try
+        lists:ukeymerge(1, lists:ukeysort(1, Opts), lists:ukeysort(1, Default))
+    catch
+        _:Reason ->
+            ?LOG_WARNING("Failed to merge socket options with ~p", [Reason]),
+            Default
+    end.
 
 %%
 
