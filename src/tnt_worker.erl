@@ -307,16 +307,15 @@ connected(internal, process_queue, #data{sync = Sync, pending = Queue} = Data) -
         {empty, _} ->
             keep_state_and_data;
 
-        {{value, Req = #request{msg = Msg, timer = Timer, ref = Ref}}, Q} ->
+        {{value, Req = #request{msg = Msg, ref = Ref}}, Q} ->
             TxData = tnt_proto:encode(Msg, Sync),
             Socket = Data#data.socket,
             case gen_tcp:send(Socket, TxData) of
                 ok ->
-                    _ = erlang:cancel_timer(Timer),
                     Holders = Data#data.holders,
                     DataUpd = Data#data{
                         pending = Q,
-                        holders = Holders#{Sync => Req#request{timer = undefined}},
+                        holders = Holders#{Sync => Req},
                         sync = tnt_proto:next_sync(Sync)
                     },
                     ok = inet:setopts(Socket, [{active, once}]),
@@ -399,7 +398,8 @@ maybe_introduce(_, Data, _) ->
 handle_response({ok, {Code, Sync, _SchemaID, Body}, Tail}, Data) ->
     case maps:take(Sync, Data#data.holders) of
         {Req, HoldersUpd} ->
-            reply(Code, Body, Req),
+            _ = erlang:cancel_timer(Req#request.timer),
+            reply(Code, Body, Req#request{timer = undefined}),
             Data#data{buffer = Tail, holders = HoldersUpd};
         error ->
             ?LOG_ERROR("Failed to find owner by sync(~p)", [Sync]),
@@ -431,19 +431,26 @@ send_sync_and_decode(Socket, TxData, Timeout) ->
     Timeout :: timeout(),
     Result :: decode_result().
 recv_and_decode(Socket, Size, Bin, Timeout) ->
+    Begin = os:timestamp(),
     case gen_tcp:recv(Socket, min(Size, 16#400000), Timeout) of
         {ok, RxData} ->
             ?LOG_DEBUG("Rx(~p)", [byte_size(RxData)]),
             Acc = <<Bin/binary, RxData/binary>>,
             case tnt_proto:decode(Acc) of
                 {wait, Sz} ->
-                    recv_and_decode(Socket, Sz, Acc, Timeout);
+                    recv_and_decode(Socket, Sz, Acc, reduce_timeout(Timeout, Begin));
                 Else ->
                     Else
             end;
         {error, _} = Err ->
             Err
     end.
+
+-spec reduce_timeout(timeout(), erlang: timestamp()) -> timeout().
+reduce_timeout(Timeout, Begin) when is_integer(Timeout) ->
+    Timeout - timer:now_diff(os:timestamp(), Begin) div 1000;
+reduce_timeout(infinity = T, _) ->
+    T.
 
 %%
 
