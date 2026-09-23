@@ -43,8 +43,8 @@
 -define(DEFAULT_RECONNECT_POLICY, {
     infinity, {exponential, ?FIRST_RECONNECT_INT, ?MAX_RECONNECT_INT}
 }).
--define(TCP_OPTS, [
-    binary,
+-define(DEFAULT_SOCK_OPTS, [
+    {mode, binary},
     {active, false},
     {packet, raw},
     {keepalive, true},
@@ -52,6 +52,7 @@
     {delay_send, false},
     {buffer, 16#010000}
 ]).
+-define(SOCKOPTS_BLACKLIST, [active, packet, mode, deliver, header, delay_send]).
 
 %% Records
 
@@ -66,6 +67,7 @@
     host :: host(),
     port :: portnum(),
     credits :: mayhap(credits()),
+    sock_opts :: socket_options(),
     pending :: pending(),
     connect_timeout :: timeout(),
     response_timeout :: timeout(),
@@ -97,8 +99,9 @@
 -type pending() :: queue:queue(request()).
 -type holders() :: #{tnt_proto:sync() := request()}.
 -type credits() :: {Username :: binary(), Password :: binary()}.
--type host() :: string() | atom() | inet:ip_address().
--type portnum() :: non_neg_integer().
+-type host() :: inet:hostname() | inet:ip_address().
+-type portnum() :: inet:port_number().
+-type socket_options() :: [gen_tcp:option()].
 -type client() :: pid().
 -type mayhap(T) :: T | undefined.
 -type decode_result() :: {ok, tuple(), binary()} | {error, any()}.
@@ -107,6 +110,7 @@
     {port, portnum()} |
     {username, binary()} |
     {password, binary()} |
+    {sock_opts, socket_options()} |
     {connect_timeout, timeout()} |
     {response_timeout, timeout()} |
     {reconnect_policy, tnt_retry:policy()}
@@ -152,10 +156,13 @@ init(Options) ->
     ConnectTimeout  = proplists:get_value(connect_timeout, Options, ?DEFAULT_TIMEOUT),
     ResponseTimeout = proplists:get_value(response_timeout, Options, ?DEFAULT_TIMEOUT),
     ReconnectPolicy = proplists:get_value(reconnect_policy, Options, ?DEFAULT_RECONNECT_POLICY),
+    UserSocketOpts0 = proplists:get_value(sock_opts, Options, []),
+    UserSocketOpts  = filter_opts(UserSocketOpts0, ?SOCKOPTS_BLACKLIST),
     Data = #data{
         host = Host,
         port = Port,
         credits = credits_build(Username, Password),
+        sock_opts = sock_opts(UserSocketOpts, ?DEFAULT_SOCK_OPTS),
         connect_timeout = ConnectTimeout,
         response_timeout = ResponseTimeout,
         pending = queue:new(),
@@ -200,7 +207,7 @@ disconnected(enter, connected, Data = #data{host = Host, port = Port, socket = S
 
 disconnected(internal, {connect, Strategy}, #data{host = Host, port = Port} = Data) ->
     ?LOG_DEBUG("Connecting to ~ts:~tp...", [Host, Port]),
-    case gen_tcp:connect(Host, Port, ?TCP_OPTS, Data#data.connect_timeout) of
+    case gen_tcp:connect(Host, Port, Data#data.sock_opts, Data#data.connect_timeout) of
         {ok, Socket} ->
             ?LOG_INFO("Connection to ~ts:~tp is established", [Host, Port]),
             case handshake(Socket, Data) of
@@ -302,16 +309,15 @@ connected(internal, process_queue, #data{sync = Sync, pending = Queue} = Data) -
         {empty, _} ->
             keep_state_and_data;
 
-        {{value, Req = #request{msg = Msg, timer = Timer, ref = Ref}}, Q} ->
+        {{value, Req = #request{msg = Msg, ref = Ref}}, Q} ->
             TxData = tnt_proto:encode(Msg, Sync),
             Socket = Data#data.socket,
             case gen_tcp:send(Socket, TxData) of
                 ok ->
-                    _ = erlang:cancel_timer(Timer),
                     Holders = Data#data.holders,
                     DataUpd = Data#data{
                         pending = Q,
-                        holders = Holders#{Sync => Req#request{timer = undefined}},
+                        holders = Holders#{Sync => Req},
                         sync = tnt_proto:next_sync(Sync)
                     },
                     ok = inet:setopts(Socket, [{active, once}]),
@@ -394,7 +400,8 @@ maybe_introduce(_, Data, _) ->
 handle_response({ok, {Code, Sync, _SchemaID, Body}, Tail}, Data) ->
     case maps:take(Sync, Data#data.holders) of
         {Req, HoldersUpd} ->
-            reply(Code, Body, Req),
+            _ = erlang:cancel_timer(Req#request.timer),
+            reply(Code, Body, Req#request{timer = undefined}),
             Data#data{buffer = Tail, holders = HoldersUpd};
         error ->
             ?LOG_ERROR("Failed to find owner by sync(~p)", [Sync]),
@@ -426,19 +433,26 @@ send_sync_and_decode(Socket, TxData, Timeout) ->
     Timeout :: timeout(),
     Result :: decode_result().
 recv_and_decode(Socket, Size, Bin, Timeout) ->
-    case gen_tcp:recv(Socket, Size, Timeout) of
+    Begin = os:timestamp(),
+    case gen_tcp:recv(Socket, min(Size, 16#400000), Timeout) of
         {ok, RxData} ->
             ?LOG_DEBUG("Rx(~p)", [byte_size(RxData)]),
             Acc = <<Bin/binary, RxData/binary>>,
             case tnt_proto:decode(Acc) of
-                {wait, _} ->
-                    recv_and_decode(Socket, Size, Acc, Timeout);
+                {wait, Sz} ->
+                    recv_and_decode(Socket, Sz, Acc, reduce_timeout(Timeout, Begin));
                 Else ->
                     Else
             end;
         {error, _} = Err ->
             Err
     end.
+
+-spec reduce_timeout(timeout(), erlang: timestamp()) -> timeout().
+reduce_timeout(Timeout, Begin) when is_integer(Timeout) ->
+    Timeout - timer:now_diff(os:timestamp(), Begin) div 1000;
+reduce_timeout(infinity = T, _) ->
+    T.
 
 %%
 
@@ -453,6 +467,29 @@ credits_username(undefined) ->
     <<"guest">>;
 credits_username({Username, _}) ->
     Username.
+
+-spec sock_opts(socket_options(), socket_options()) -> socket_options().
+sock_opts([], Default) ->
+    Default;
+sock_opts(Opts, Default) ->
+    try
+        lists:ukeymerge(1, lists:ukeysort(1, Opts), lists:ukeysort(1, Default))
+    catch
+        _:Reason ->
+            ?LOG_WARNING("Failed to merge socket options with ~p", [Reason]),
+            Default
+    end.
+
+-spec filter_opts(socket_options(), list(atom())) -> socket_options().
+filter_opts([], _Blacklist) ->
+    [];
+filter_opts(Opts, Blacklist) ->
+    [Opt || Opt <- Opts, not is_blacklisted(Opt, Blacklist)].
+
+is_blacklisted({Key, _Value}, Blacklist) ->
+    lists:member(Key, Blacklist);
+is_blacklisted(_, _) ->
+    false.
 
 %%
 

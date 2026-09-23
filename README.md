@@ -12,6 +12,7 @@ Options
 * `port`: integer, default: 3301
 * `username`: string, default: undefined
 * `password`: string, default: <<>>
+* `sock_opts`: user socket options. Example: to increase the Erlang driver's receive buffer, pass `[{buffer, 256 * 1024}]`.
 * `connect_timeout`: connection timeout (milliseconds), default: 5000
 * `response_timeout`: request response timeout (milliseconds), default: 5000
 * `reconnect_policy`: the rule that determines the delay between reconnection attempts,
