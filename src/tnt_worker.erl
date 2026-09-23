@@ -44,7 +44,7 @@
     infinity, {exponential, ?FIRST_RECONNECT_INT, ?MAX_RECONNECT_INT}
 }).
 -define(DEFAULT_SOCK_OPTS, [
-    binary,
+    {mode, binary},
     {active, false},
     {packet, raw},
     {keepalive, true},
@@ -52,6 +52,7 @@
     {delay_send, false},
     {buffer, 16#010000}
 ]).
+-define(SOCKOPTS_BLACKLIST, [active, packet, mode, deliver, header, delay_send]).
 
 %% Records
 
@@ -155,7 +156,8 @@ init(Options) ->
     ConnectTimeout  = proplists:get_value(connect_timeout, Options, ?DEFAULT_TIMEOUT),
     ResponseTimeout = proplists:get_value(response_timeout, Options, ?DEFAULT_TIMEOUT),
     ReconnectPolicy = proplists:get_value(reconnect_policy, Options, ?DEFAULT_RECONNECT_POLICY),
-    UserSocketOpts  = proplists:get_value(sock_opts, Options, []),
+    UserSocketOpts0 = proplists:get_value(sock_opts, Options, []),
+    UserSocketOpts  = filter_opts(UserSocketOpts0, ?SOCKOPTS_BLACKLIST),
     Data = #data{
         host = Host,
         port = Port,
@@ -477,6 +479,17 @@ sock_opts(Opts, Default) ->
             ?LOG_WARNING("Failed to merge socket options with ~p", [Reason]),
             Default
     end.
+
+-spec filter_opts(socket_options(), list(atom())) -> socket_options().
+filter_opts([], _Blacklist) ->
+    [];
+filter_opts(Opts, Blacklist) ->
+    [Opt || Opt <- Opts, not is_blacklisted(Opt, Blacklist)].
+
+is_blacklisted({Key, _Value}, Blacklist) ->
+    lists:member(Key, Blacklist);
+is_blacklisted(_, _) ->
+    false.
 
 %%
 
