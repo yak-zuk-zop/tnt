@@ -286,7 +286,7 @@ connected(info, {tcp, Socket, RxData}, #data{socket = Socket} = Data) ->
             ?LOG_DEBUG("Rx(~tp); incomplete (expected: ~tp bytes)",
                 [byte_size(RxData), Sz]
             ),
-            recv_and_decode(Socket, Sz, Bin, Data#data.response_timeout);
+            recv_and_decode(Socket, Sz, [Bin], Data#data.response_timeout);
         Else ->
             Else
     end,
@@ -421,36 +421,50 @@ handle_response({error, Reason}, Data) ->
 send_sync_and_decode(Socket, TxData, Timeout) ->
     case gen_tcp:send(Socket, TxData) of
         ok ->
-            recv_and_decode(Socket, 0, <<>>, Timeout);
+            recv_and_decode(Socket, 0, [], Timeout);
         {error, _} = Err ->
             Err
     end.
 
--spec recv_and_decode(Socket, Size, Bin, Timeout) -> Result when
+-spec recv_and_decode(Socket, Size, Bins, Timeout) -> Result when
     Socket :: gen_tcp:socket(),
     Size :: non_neg_integer(),
-    Bin :: binary(),
+    Bins :: [binary()],
     Timeout :: timeout(),
     Result :: decode_result().
-recv_and_decode(Socket, Size, Bin, Timeout) ->
+recv_and_decode(_Socket, _Size, _Bins, 0) ->
+    {error, timeout};
+recv_and_decode(_Socket, 0, [_ | _] = Bins, _Timeout) ->
+    tnt_proto:decode(iolist_to_binary(lists:reverse(Bins)));
+recv_and_decode(Socket, 0, [], Timeout) ->
     Begin = os:timestamp(),
-    case gen_tcp:recv(Socket, min(Size, 16#400000), Timeout) of
+    case gen_tcp:recv(Socket, 0, Timeout) of
         {ok, RxData} ->
             ?LOG_DEBUG("Rx(~p)", [byte_size(RxData)]),
-            Acc = <<Bin/binary, RxData/binary>>,
-            case tnt_proto:decode(Acc) of
+            case tnt_proto:decode(RxData) of
                 {wait, Sz} ->
-                    recv_and_decode(Socket, Sz, Acc, reduce_timeout(Timeout, Begin));
+                    recv_and_decode(Socket, Sz, [RxData], reduce_timeout(Timeout, Begin));
                 Else ->
                     Else
             end;
+        {error, _} = Err ->
+            Err
+    end;
+recv_and_decode(Socket, Size, Bins, Timeout) ->
+    Begin = os:timestamp(),
+    case gen_tcp:recv(Socket, min(Size, 16#400000), Timeout) of
+        {ok, RxData} ->
+            Sz = byte_size(RxData),
+            ?LOG_DEBUG("Rx(~p)", [Sz]),
+            Acc = [RxData | Bins],
+            recv_and_decode(Socket, Size - Sz, Acc, reduce_timeout(Timeout, Begin));
         {error, _} = Err ->
             Err
     end.
 
 -spec reduce_timeout(timeout(), erlang: timestamp()) -> timeout().
 reduce_timeout(Timeout, Begin) when is_integer(Timeout) ->
-    Timeout - timer:now_diff(os:timestamp(), Begin) div 1000;
+    max(0, Timeout - timer:now_diff(os:timestamp(), Begin) div 1000);
 reduce_timeout(infinity = T, _) ->
     T.
 
