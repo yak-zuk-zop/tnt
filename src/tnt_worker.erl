@@ -289,7 +289,7 @@ connected(info, {tcp, Socket, RxData}, #data{socket = Socket} = Data) ->
     Res = case tnt_proto:decode(Bin, tnt_proto:build_context()) of
         {wait, #context{total = Total} = Ctx} ->
             RxSz = byte_size(RxData),
-            ExpSz = Total - RxSz,
+            ExpSz = size_left(0, RxSz, Total),
             ?LOG_DEBUG("Rx(~tp); incomplete (expected: ~tp bytes)", [RxSz, ExpSz]),
             recv_and_decode(Socket, ExpSz, Ctx, Data#data.response_timeout);
         Else ->
@@ -451,24 +451,25 @@ send_sync_and_decode(Socket, TxData, Timeout) ->
             Err
     end.
 
--spec recv_and_decode(Socket, Size, Ctx, Timeout) -> Result when
+-spec recv_and_decode(Socket, SizeLeft, Ctx, Timeout) -> Result when
     Socket :: gen_tcp:socket(),
-    Size :: non_neg_integer(),
+    SizeLeft :: non_neg_integer(),
     Ctx :: context(),
     Timeout :: timeout(),
     Result :: decode_result().
-recv_and_decode(_Socket, _Size, _Ctx, 0) ->
+recv_and_decode(_Socket, _SizeLeft, _Ctx, 0) ->
     {error, timeout};
-recv_and_decode(Socket, Size, Ctx, Timeout) ->
+recv_and_decode(Socket, SizeLeft, Ctx, Timeout) ->
     Begin = os:timestamp(),
-    case gen_tcp:recv(Socket, max(0, min(Size, 16#400000)), Timeout) of
+    case gen_tcp:recv(Socket, min(SizeLeft, 16#400000), Timeout) of
         {ok, RxData} ->
             RxSz = byte_size(RxData),
             ?LOG_DEBUG("Rx(~p)", [RxSz]),
             case tnt_proto:decode(RxData, Ctx) of
                 {wait, #context{total = Total} = CtxUpd} ->
                     TimeoutUpd = reduce_timeout(Timeout, Begin),
-                    recv_and_decode(Socket, Total - RxSz, CtxUpd, TimeoutUpd);
+                    ExpSz = size_left(SizeLeft, RxSz, Total),
+                    recv_and_decode(Socket, ExpSz, CtxUpd, TimeoutUpd);
                 Else ->
                     Else
             end;
@@ -481,6 +482,17 @@ reduce_timeout(Timeout, Begin) when is_integer(Timeout) ->
     max(0, Timeout - timer:now_diff(os:timestamp(), Begin) div 1000);
 reduce_timeout(infinity = T, _) ->
     T.
+
+-spec size_left(Left, RxSz, Total) -> non_neg_integer() when
+    Left :: non_neg_integer(),
+    RxSz :: pos_integer(),
+    Total :: non_neg_integer().
+size_left(0, _RxSz, 0) ->
+    0;
+size_left(0, RxSz, Total) ->
+    Total - RxSz;
+size_left(Left, RxSz, _Total) ->
+    Left - RxSz.
 
 %%
 
