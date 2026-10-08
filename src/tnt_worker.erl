@@ -315,24 +315,33 @@ connected(internal, process_queue, #data{sync = Sync, pending = Queue} = Data) -
             keep_state_and_data;
 
         {{value, Req = #request{msg = Msg, ref = Ref}}, Q} ->
-            TxData = tnt_proto:encode(Msg, Sync),
-            Socket = Data#data.socket,
-            case gen_tcp:send(Socket, TxData) of
-                ok ->
-                    Holders = Data#data.holders,
-                    DataUpd = Data#data{
-                        pending = Q,
-                        holders = Holders#{Sync => Req},
-                        sync = tnt_proto:next_sync(Sync)
-                    },
-                    ok = inet:setopts(Socket, [{active, once}]),
-                    {keep_state, DataUpd};
-
-                {error, Err} ->
-                    ?LOG_ERROR("Failed to send(~tp) ~tp:~p with ~p", [
-                        Sync, tnt_proto:get_request_type(Msg), Ref, Err
-                    ]),
-                    {next_state, disconnected, Data}
+            try
+                TxData = tnt_proto:encode(Msg, Sync),
+                Socket = Data#data.socket,
+                case gen_tcp:send(Socket, TxData) of
+                    ok ->
+                        Holders = Data#data.holders,
+                        DataUpd = Data#data{
+                            pending = Q,
+                            holders = Holders#{Sync => Req},
+                            sync = tnt_proto:next_sync(Sync)
+                        },
+                        ok = inet:setopts(Socket, [{active, once}]),
+                        {keep_state, DataUpd};
+                    {error, Reason} ->
+                        ?LOG_ERROR("Failed to send(~tp) ~tp:~p with ~p", [
+                            Sync, tnt_proto:get_request_type(Msg), Ref, Reason
+                        ]),
+                        %reply(cancel_req_timer(Req), Err),
+                        {next_state, disconnected, Data}
+                end
+            catch
+                error:What:STrace ->
+                    ?LOG_ERROR("Exception(~p) occured. Stacktrace: ~p", [What, STrace]),
+                    reply(cancel_req_timer(Req), {error, What}),
+                    {keep_state, Data#data{
+                        pending = Q
+                    }}
             end
     end.
 
@@ -405,10 +414,7 @@ maybe_introduce(_, Data, _) ->
 handle_response({ok, #context{sync = Sync} = Ctx, Tail}, Data) ->
     case maps:take(Sync, Data#data.holders) of
         {Req, HoldersUpd} ->
-            _ = erlang:cancel_timer(Req#request.timer),
-            Code = Ctx#context.code,
-            Body = Ctx#context.msg,
-            reply(Code, Body, Req#request{timer = undefined}),
+            reply(Ctx#context.code, Ctx#context.msg, cancel_req_timer(Req)),
             Data#data{buffer = Tail, holders = HoldersUpd};
         error ->
             ?LOG_ERROR("Failed to find owner by sync(~p)", [Sync]),
@@ -417,8 +423,7 @@ handle_response({ok, #context{sync = Sync} = Ctx, Tail}, Data) ->
 handle_response({error, #context{sync = Sync} = Ctx}, Data) when is_integer(Sync) ->
     case maps:take(Sync, Data#data.holders) of
         {Req, HoldersUpd} ->
-            _ = erlang:cancel_timer(Req#request.timer),
-            reply(Req#request{timer = undefined}, {error, Ctx#context.msg}),
+            reply(cancel_req_timer(Req), {error, Ctx#context.msg}),
             Data#data{buffer = <<>>, holders = HoldersUpd};
         error ->
             ?LOG_ERROR("Failed to find owner by sync(~p)", [Sync]),
@@ -456,7 +461,7 @@ recv_and_decode(_Socket, _Size, _Ctx, 0) ->
     {error, timeout};
 recv_and_decode(Socket, Size, Ctx, Timeout) ->
     Begin = os:timestamp(),
-    case gen_tcp:recv(Socket, min(Size, 16#400000), Timeout) of
+    case gen_tcp:recv(Socket, max(0, min(Size, 16#400000)), Timeout) of
         {ok, RxData} ->
             RxSz = byte_size(RxData),
             ?LOG_DEBUG("Rx(~p)", [RxSz]),
@@ -531,6 +536,13 @@ create_req_timer(Req, Msecs) ->
     Req#request{
         timer = erlang:send_after(Msecs, self(), {request_timeout, Req})
     }.
+
+-spec cancel_req_timer(request()) -> request().
+cancel_req_timer(Req = #request{timer = Timer}) when is_reference(Timer) ->
+    _ = erlang:cancel_timer(Timer),
+    Req#request{timer = undefined};
+cancel_req_timer(Req) ->
+    Req.
 
 %%
 
