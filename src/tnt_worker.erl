@@ -2,6 +2,7 @@
 
 -include_lib("kernel/include/logger.hrl").
 -include("tnt.hrl").
+-include("tnt_int.hrl").
 
 -behaviour(gen_statem).
 
@@ -104,7 +105,11 @@
 -type socket_options() :: [gen_tcp:option()].
 -type client() :: pid().
 -type mayhap(T) :: T | undefined.
--type decode_result() :: {ok, tuple(), binary()} | {error, any()}.
+-type context() :: #context{}.
+-type decode_result() ::
+    {ok, context(), binary()} |
+    {error, context()} |
+    {error, any()}.
 -type options() :: [
     {host, host()} |
     {port, portnum()} |
@@ -281,12 +286,12 @@ connected(info, {tcp_closed, Socket}, Data = #data{socket = Socket}) ->
 
 connected(info, {tcp, Socket, RxData}, #data{socket = Socket} = Data) ->
     Bin = <<(Data#data.buffer)/binary, RxData/binary>>,
-    Res = case tnt_proto:decode(Bin) of
-        {wait, Sz} ->
-            ?LOG_DEBUG("Rx(~tp); incomplete (expected: ~tp bytes)",
-                [byte_size(RxData), Sz]
-            ),
-            recv_and_decode(Socket, Sz, [Bin], Data#data.response_timeout);
+    Res = case tnt_proto:decode(Bin, tnt_proto:build_context()) of
+        {wait, #context{total = Total} = Ctx} ->
+            RxSz = byte_size(RxData),
+            ExpSz = Total - RxSz,
+            ?LOG_DEBUG("Rx(~tp); incomplete (expected: ~tp bytes)", [RxSz, ExpSz]),
+            recv_and_decode(Socket, ExpSz, Ctx, Data#data.response_timeout);
         Else ->
             Else
     end,
@@ -333,7 +338,7 @@ connected(internal, process_queue, #data{sync = Sync, pending = Queue} = Data) -
 
 %%-- internals ----------------------------------------------------------------
 
--spec reply(integer(), tnt_proto:proto(), request()) -> ok.
+-spec reply(tnt_proto:code(), tnt_proto:proto(), request()) -> ok.
 reply(?IPROTO_OK, Body, Req) ->
     Type = tnt_proto:get_request_type(Req#request.msg),
     Reply = {ok, tnt_proto:make_reply_ok(Type, Body)},
@@ -372,12 +377,12 @@ maybe_introduce(Socket, Data = #data{credits = {User, Pwd}}, Salt) ->
         AuthReq = tnt_proto:request_auth(User, Pwd, Salt),
         TxData = tnt_proto:encode(AuthReq, Sync),
         case send_sync_and_decode(Socket, TxData, Timeout) of
-            {ok, {?IPROTO_OK, _Sync, _SchemaID, ?IPROTO_BODY_OK}, Tail} ->
+            {ok, #context{code = ?IPROTO_OK, msg = ?IPROTO_BODY_OK}, Tail} ->
                 {ok, Data#data{
                     buffer = Tail,
                     sync = tnt_proto:next_sync(Sync)
                 }};
-            {ok, {Code, _Sync, _SchemaID, Body}, Tail} ->
+            {ok, #context{code = Code, msg = Body}, Tail} ->
                 ?LOG_ERROR("Auth failed with: ~p", [tnt_proto:get_error(Code, Body)]),
                 {error, Data#data{
                     buffer = Tail
@@ -397,15 +402,27 @@ maybe_introduce(_, Data, _) ->
     }}.
 
 -spec handle_response(decode_result(), data()) -> data().
-handle_response({ok, {Code, Sync, _SchemaID, Body}, Tail}, Data) ->
+handle_response({ok, #context{sync = Sync} = Ctx, Tail}, Data) ->
     case maps:take(Sync, Data#data.holders) of
         {Req, HoldersUpd} ->
             _ = erlang:cancel_timer(Req#request.timer),
+            Code = Ctx#context.code,
+            Body = Ctx#context.msg,
             reply(Code, Body, Req#request{timer = undefined}),
             Data#data{buffer = Tail, holders = HoldersUpd};
         error ->
             ?LOG_ERROR("Failed to find owner by sync(~p)", [Sync]),
             Data#data{buffer = Tail}
+    end;
+handle_response({error, #context{sync = Sync} = Ctx}, Data) when is_integer(Sync) ->
+    case maps:take(Sync, Data#data.holders) of
+        {Req, HoldersUpd} ->
+            _ = erlang:cancel_timer(Req#request.timer),
+            reply(Req#request{timer = undefined}, {error, Ctx#context.msg}),
+            Data#data{buffer = <<>>, holders = HoldersUpd};
+        error ->
+            ?LOG_ERROR("Failed to find owner by sync(~p)", [Sync]),
+            Data#data{buffer = <<>>}
     end;
 handle_response({error, Reason}, Data) ->
     ?LOG_ERROR("Failed to decode with: ~p", [Reason]),
@@ -419,50 +436,42 @@ handle_response({error, Reason}, Data) ->
     Timeout :: timeout(),
     Result :: decode_result().
 send_sync_and_decode(Socket, TxData, Timeout) ->
+    Begin = os:timestamp(),
     case gen_tcp:send(Socket, TxData) of
         ok ->
-            recv_and_decode(Socket, 0, [], Timeout);
+            Ctx = tnt_proto:build_context(),
+            TimeoutUpd = reduce_timeout(Timeout, Begin),
+            recv_and_decode(Socket, 0, Ctx, TimeoutUpd);
         {error, _} = Err ->
             Err
     end.
 
--spec recv_and_decode(Socket, Size, Bins, Timeout) -> Result when
+-spec recv_and_decode(Socket, Size, Ctx, Timeout) -> Result when
     Socket :: gen_tcp:socket(),
     Size :: non_neg_integer(),
-    Bins :: [binary()],
+    Ctx :: context(),
     Timeout :: timeout(),
     Result :: decode_result().
-recv_and_decode(_Socket, _Size, _Bins, 0) ->
+recv_and_decode(_Socket, _Size, _Ctx, 0) ->
     {error, timeout};
-recv_and_decode(_Socket, 0, [_ | _] = Bins, _Timeout) ->
-    tnt_proto:decode(iolist_to_binary(lists:reverse(Bins)));
-recv_and_decode(Socket, 0, [], Timeout) ->
+recv_and_decode(Socket, Size, Ctx, Timeout) ->
     Begin = os:timestamp(),
-    case gen_tcp:recv(Socket, 0, Timeout) of
+    case gen_tcp:recv(Socket, min(Size, 16#400000), Timeout) of
         {ok, RxData} ->
-            ?LOG_DEBUG("Rx(~p)", [byte_size(RxData)]),
-            case tnt_proto:decode(RxData) of
-                {wait, Sz} ->
-                    recv_and_decode(Socket, Sz, [RxData], reduce_timeout(Timeout, Begin));
+            RxSz = byte_size(RxData),
+            ?LOG_DEBUG("Rx(~p)", [RxSz]),
+            case tnt_proto:decode(RxData, Ctx) of
+                {wait, #context{total = Total} = CtxUpd} ->
+                    TimeoutUpd = reduce_timeout(Timeout, Begin),
+                    recv_and_decode(Socket, Total - RxSz, CtxUpd, TimeoutUpd);
                 Else ->
                     Else
             end;
         {error, _} = Err ->
             Err
-    end;
-recv_and_decode(Socket, Size, Bins, Timeout) ->
-    Begin = os:timestamp(),
-    case gen_tcp:recv(Socket, min(Size, 16#400000), Timeout) of
-        {ok, RxData} ->
-            Sz = byte_size(RxData),
-            ?LOG_DEBUG("Rx(~p)", [Sz]),
-            Acc = [RxData | Bins],
-            recv_and_decode(Socket, Size - Sz, Acc, reduce_timeout(Timeout, Begin));
-        {error, _} = Err ->
-            Err
     end.
 
--spec reduce_timeout(timeout(), erlang: timestamp()) -> timeout().
+-spec reduce_timeout(timeout(), erlang:timestamp()) -> timeout().
 reduce_timeout(Timeout, Begin) when is_integer(Timeout) ->
     max(0, Timeout - timer:now_diff(os:timestamp(), Begin) div 1000);
 reduce_timeout(infinity = T, _) ->

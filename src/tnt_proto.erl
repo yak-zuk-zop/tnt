@@ -1,17 +1,28 @@
 -module(tnt_proto).
 
 -include("tnt.hrl").
+-include("tnt_int.hrl").
 
-%% API
+%% API: context
 -export([
-    decode/1,
-    encode/2,
-    next_sync/1,
-    make_reply_ok/2,
-    get_error/2
+    build_context/0
 ]).
 
-%% requests
+%% API: serialization
+-export([
+    decode/2,
+    encode/2
+]).
+
+%% API: helpers
+-export([
+    next_sync/1,
+    make_reply_ok/2,
+    get_error/2,
+    get_request_type/1
+]).
+
+%% API: requests
 -export([
     request_auth/3,
     request_select/6,
@@ -23,8 +34,7 @@
     request_delete/3,
     request_call/2,
     request_eval/2,
-    request_ping/0,
-    get_request_type/1
+    request_ping/0
 ]).
 
 -ifdef(TEST).
@@ -41,6 +51,7 @@
     tnt_tuple/0,
     key/0,
     sync/0,
+    code/0,
     proto/0,
     operation/0,
     error_message/0
@@ -48,8 +59,12 @@
 
 %% Macros
 
--define(MPACKOPTS, [{spec, old}, {map_format, jsx}]).
 -define(CHAP, <<"chap-sha1">>).
+-define(MPACKOPTS, [
+    {spec, old},
+    {string, as_binary},
+    {map_format, jsx}
+]).
 
 -define(IPROTO_CODE,         16#00).
 -define(IPROTO_SYNC,         16#01).
@@ -82,41 +97,68 @@
 -type request() :: {request_type(), Body :: binary()}.
 -type space_id() :: pos_integer().
 -type index_id() :: non_neg_integer().
--type tnt_tuple() :: list().
+-type tnt_tuple() :: msgpack:msgpack_term().
 -type key() :: list().
 -type sync() :: 1 .. 16#FFFFFFFF.
+-type code() :: non_neg_integer().
 -type proto() :: list({integer(), term()}).
 -type operation() :: nonempty_list().
 -type error_message() :: {Code :: pos_integer(), Msg :: iodata()} | {unknown, proto()}.
+-type context() :: #context{}.
 
-%%-- API ----------------------------------------------------------------------
+%%-- API: context -------------------------------------------------------------
 
--spec decode(binary()) -> Result when
-    Result :: {ok, tuple(), binary()} | {wait, pos_integer()} | {error, any()}.
-decode(Data) ->
+-spec build_context() -> context().
+build_context() ->
+    #context{state = initial, total = 0}.
+
+%%-- API: serialization -------------------------------------------------------
+
+-spec decode(binary(), context()) -> Result when
+    Result :: {ok, context(), binary()}
+            | {wait | error, context()}.
+decode(Data, #context{state = initial} = Ctx) ->
     case msgpack:unpack_stream(Data) of
-        {N, Rest} when is_integer(N), N =< byte_size(Rest) ->
+        {N, Rest} when is_integer(N) ->
             case msgpack:unpack_stream(Rest, ?MPACKOPTS) of
-                {error, _} = Err ->
-                    Err;
+                {error, incomplete} ->
+                    {wait, Ctx#context{total = N}};
+                {error, What} ->
+                    {error, Ctx#context{msg = What}};
                 {Hdr, BinBody} when is_list(Hdr) ->
-                    Opts = [{unpack_str, as_binary}, {map_format, jsx}],
-                    case msgpack:unpack_stream(BinBody, Opts) of
-                        {error, _} = Err ->
-                            Err;
+                    CtxWithHdr = Ctx#context{
+                        total = N,
+                        code = proplists:get_value(?IPROTO_CODE, Hdr),
+                        sync = proplists:get_value(?IPROTO_SYNC, Hdr),
+                        schema = proplists:get_value(?IPROTO_SCHEMA_ID, Hdr)
+                    },
+                    case msgpack:decode_start(BinBody, ?MPACKOPTS) of
+                        {error, What} ->
+                            CtxWithHdr#context{msg = What};
+                        {continue, State} ->
+                            {wait, CtxWithHdr#context{state = State}};
                         {Body, Tail} ->
-                            Code = proplists:get_value(?IPROTO_CODE, Hdr),
-                            Sync = proplists:get_value(?IPROTO_SYNC, Hdr),
-                            SchemaID = proplists:get_value(?IPROTO_SCHEMA_ID, Hdr),
-                            {ok, {Code, Sync, SchemaID, Body}, Tail}
+                            {ok, CtxWithHdr#context{
+                                state = complete,
+                                msg = Body
+                            }, Tail}
                     end
             end;
-        {N, Rest} when is_integer(N) ->
-            {wait, N - byte_size(Rest)};
-        {error, _} = Err ->
-            Err;
+        {error, incomplete} ->
+            {wait, Ctx};
+        {error, What} ->
+            {error, Ctx#context{msg = What}};
         {Result, _} ->
-            {error, {unexpected, Result}}
+            {error, Ctx#context{msg = {unexpected, Result}}}
+    end;
+decode(Data, #context{state = {continue, State0}} = Ctx) ->
+    case msgpack:decode_continue(Data, State0) of
+        {error, What} ->
+            {error, Ctx#context{msg = What}};
+        {continue, _} = State ->
+            {wait, Ctx#context{state = State}};
+        {Body, Tail} ->
+            {ok, Ctx#context{state = complete, msg = Body}, Tail}
     end.
 
 -spec encode(request(), sync()) -> binary().
@@ -131,11 +173,13 @@ encode({ReqType, Body}, Sync) ->
     TotalSZ = msgpack:pack(byte_size(Head) + byte_size(Body)),
     <<TotalSZ/binary, Head/binary, Body/binary>>.
 
+%%-- API: helpers -------------------------------------------------------------
+
 -spec next_sync(sync()) -> sync().
 next_sync(16#FFFFFFFF) -> 1;
 next_sync(Sync) -> Sync + 1.
 
--spec get_error(pos_integer(), proto()) -> error_message().
+-spec get_error(code(), proto()) -> error_message().
 get_error(Code, Body) ->
     case proplists:get_value(?IPROTO_ERROR_24, Body) of
         undefined ->
@@ -163,7 +207,7 @@ make_reply_ok(_Type, [{?IPROTO_DATA, Body}]) ->
 get_request_type({Type, _}) ->
     Type.
 
-%%-- requests -----------------------------------------------------------------
+%%-- API: requests ------------------------------------------------------------
 
 -spec request_auth(binary(), binary(), binary()) -> request().
 request_auth(Username, Password, <<Salt:20/binary, _/binary>>) ->
