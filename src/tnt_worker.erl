@@ -287,11 +287,10 @@ connected(info, {tcp_closed, Socket}, Data = #data{socket = Socket}) ->
 connected(info, {tcp, Socket, RxData}, #data{socket = Socket} = Data) ->
     Bin = <<(Data#data.buffer)/binary, RxData/binary>>,
     Res = case tnt_proto:decode(Bin, tnt_proto:build_context()) of
-        {wait, #context{total = Total} = Ctx} ->
+        {wait, #context{wait = ExpSz} = Ctx} ->
             RxSz = byte_size(RxData),
-            ExpSz = size_left(0, RxSz, Total),
             ?LOG_DEBUG("Rx(~tp); incomplete (expected: ~tp bytes)", [RxSz, ExpSz]),
-            recv_and_decode(Socket, ExpSz, Ctx, Data#data.response_timeout);
+            recv_and_decode(Socket, Ctx, Data#data.response_timeout);
         Else ->
             Else
     end,
@@ -447,20 +446,19 @@ send_sync_and_decode(Socket, TxData, Timeout) ->
             ?LOG_DEBUG("Tx(~p)", [byte_size(TxData)]),
             Ctx = tnt_proto:build_context(),
             TimeoutUpd = reduce_timeout(Timeout, Begin),
-            recv_and_decode(Socket, 0, Ctx, TimeoutUpd);
+            recv_and_decode(Socket, Ctx, TimeoutUpd);
         {error, _} = Err ->
             Err
     end.
 
--spec recv_and_decode(Socket, SizeLeft, Ctx, Timeout) -> Result when
+-spec recv_and_decode(Socket, Ctx, Timeout) -> Result when
     Socket :: gen_tcp:socket(),
-    SizeLeft :: non_neg_integer(),
     Ctx :: context(),
     Timeout :: timeout(),
     Result :: decode_result().
-recv_and_decode(_Socket, _SizeLeft, _Ctx, 0) ->
+recv_and_decode(_Socket, _Ctx, 0) ->
     {error, timeout};
-recv_and_decode(Socket, SizeLeft, Ctx, Timeout) ->
+recv_and_decode(Socket, #context{wait = SizeLeft} = Ctx, Timeout) ->
     ?LOG_DEBUG("Ctx: ~p", [Ctx]),
     Begin = os:timestamp(),
     case gen_tcp:recv(Socket, min(SizeLeft, 16#400000), Timeout) of
@@ -468,10 +466,9 @@ recv_and_decode(Socket, SizeLeft, Ctx, Timeout) ->
             RxSz = byte_size(RxData),
             ?LOG_DEBUG("Rx(~p)", [RxSz]),
             case tnt_proto:decode(RxData, Ctx) of
-                {wait, #context{total = Total} = CtxUpd} ->
+                {wait, CtxUpd} ->
                     TimeoutUpd = reduce_timeout(Timeout, Begin),
-                    ExpSz = size_left(SizeLeft, RxSz, Total),
-                    recv_and_decode(Socket, ExpSz, CtxUpd, TimeoutUpd);
+                    recv_and_decode(Socket, CtxUpd, TimeoutUpd);
                 Else ->
                     Else
             end;
@@ -484,17 +481,6 @@ reduce_timeout(Timeout, Begin) when is_integer(Timeout) ->
     max(0, Timeout - timer:now_diff(os:timestamp(), Begin) div 1000);
 reduce_timeout(infinity = T, _) ->
     T.
-
--spec size_left(Left, RxSz, Total) -> non_neg_integer() when
-    Left :: non_neg_integer(),
-    RxSz :: pos_integer(),
-    Total :: non_neg_integer().
-size_left(0, _RxSz, 0) ->
-    0;
-size_left(0, RxSz, Total) ->
-    Total - RxSz;
-size_left(Left, RxSz, _Total) ->
-    Left - RxSz.
 
 %%
 

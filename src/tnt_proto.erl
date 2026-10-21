@@ -110,7 +110,7 @@
 
 -spec build_context() -> context().
 build_context() ->
-    #context{state = {initial, <<>>}, total = 0}.
+    #context{state = {initial, <<>>}, wait = 0}.
 
 %%-- API: serialization -------------------------------------------------------
 
@@ -123,21 +123,26 @@ decode(Chunk, #context{state = {initial, Prev}} = Ctx) ->
         {N, Rest} when is_integer(N) ->
             case msgpack:unpack_stream(Rest, ?MPACKOPTS) of
                 {error, incomplete} ->
-                    {wait, Ctx#context{state = {initial, Bin}, total = N}};
+                    {wait, Ctx#context{
+                        state = {initial, Bin},
+                        wait = N - byte_size(Rest)
+                    }};
                 {error, What} ->
                     {error, Ctx#context{msg = What}};
                 {Hdr, BinBody} when is_list(Hdr) ->
                     CtxWithHdr = Ctx#context{
-                        total = N,
                         code = proplists:get_value(?IPROTO_CODE, Hdr),
                         sync = proplists:get_value(?IPROTO_SYNC, Hdr),
                         schema = proplists:get_value(?IPROTO_SCHEMA_ID, Hdr)
                     },
                     case msgpack:decode_start(BinBody, ?MPACKOPTS) of
                         {error, What} ->
-                            CtxWithHdr#context{msg = What};
+                            {error, CtxWithHdr#context{msg = What}};
                         {continue, _} = State ->
-                            {wait, CtxWithHdr#context{state = State}};
+                            {wait, CtxWithHdr#context{
+                                state = State,
+                                wait = N - byte_size(Rest)
+                            }};
                         {Body, Tail} ->
                             {ok, CtxWithHdr#context{
                                 state = complete,
@@ -152,14 +157,22 @@ decode(Chunk, #context{state = {initial, Prev}} = Ctx) ->
         {Result, _} ->
             {error, Ctx#context{msg = {unexpected, Result}}}
     end;
-decode(Chunk, #context{state = {continue, State0}} = Ctx) ->
+decode(Chunk, #context{state = {continue, State0}, wait = N} = Ctx) ->
     case msgpack:decode_continue(Chunk, State0) of
         {error, What} ->
             {error, Ctx#context{msg = What}};
         {continue, _} = State ->
-            {wait, Ctx#context{state = State}};
+            {wait, Ctx#context{
+                state = State,
+                wait = N - byte_size(Chunk)
+            }};
         {Body, Tail} ->
-            {ok, Ctx#context{state = complete, msg = Body}, Tail}
+            CtxUpd = Ctx#context{
+                state = complete,
+                msg = Body,
+                wait = 0
+            },
+            {ok, CtxUpd, Tail}
     end;
 decode(Chunk, #context{state = complete} = Ctx) ->
     {ok, Ctx, Chunk}.
