@@ -1,4 +1,4 @@
 [{<<"msgpack">>,
   {git,"https://github.com/yak-zuk-zop/msgpack.git",
-       {ref,"5eaa6313fadecaaaf5f07ee73e3952e2d91e6592"}},
+       {ref,"5b7c2e444d2ef08177d0070a6c62600473309b26"}},
   0}].
